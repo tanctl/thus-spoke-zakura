@@ -1159,13 +1159,51 @@ mod tests {
             let mut snapshot = state.0.wallet_snapshot.write().await;
             snapshot.accounts[0].orchard_zatoshi = 400_000_000;
         }
-
-        let Json(accounts) = accounts(State(state))
+        let response = router(state)
+            .oneshot(
+                Request::get("/api/v1/accounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .unwrap_or_else(|_| panic!("cached account read failed"));
-
-        assert_eq!(accounts.len(), usize::from(USER_ACCOUNT_COUNT));
-        assert_eq!(accounts[0].orchard_zatoshi, 400_000_000);
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let accounts = value.as_array().expect("account array");
+        assert_eq!(
+            accounts
+                .iter()
+                .map(|a| a["id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5],
+        );
+        assert_eq!(accounts[0]["orchard_zatoshi"], 400_000_000);
+        let expected_keys = std::collections::BTreeSet::from([
+            "id",
+            "name",
+            "unified_address",
+            "transparent_address",
+            "transparent_zatoshi",
+            "orchard_zatoshi",
+            "unified_full_viewing_key",
+        ]);
+        for account in accounts {
+            let keys = account
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(keys, expected_keys);
+            assert!(
+                account["unified_full_viewing_key"]
+                    .as_str()
+                    .is_some_and(|key| !key.is_empty())
+            );
+        }
     }
 
     #[tokio::test]
@@ -1436,6 +1474,7 @@ mod tests {
             name: "Account 6".into(),
             unified_address: "uregtest-treasury".into(),
             transparent_address: "tmTreasury".into(),
+            unified_full_viewing_key: None,
             transparent_zatoshi: 0,
             orchard_zatoshi: 0,
         };

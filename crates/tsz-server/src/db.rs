@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zcash_keys::{
     address::Address,
-    keys::{Era, UnifiedAddressRequest, UnifiedSpendingKey},
+    keys::{Era, UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
 };
 use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork};
 
@@ -26,6 +26,8 @@ pub struct Account {
     pub name: String,
     pub unified_address: String,
     pub transparent_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unified_full_viewing_key: Option<String>,
     pub transparent_zatoshi: u64,
     pub orchard_zatoshi: u64,
 }
@@ -116,11 +118,22 @@ impl Store {
     }
 
     pub fn accounts(&self) -> Result<Vec<Account>> {
-        let db = self.0.lock().unwrap();
-        let mut query = db.prepare("SELECT id,name,unified_address,transparent_address,transparent_zatoshi,orchard_zatoshi FROM accounts ORDER BY id")?;
-        Ok(query
-            .query_map([], row_account)?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut accounts = {
+            let db = self.0.lock().unwrap();
+            let mut query = db.prepare("SELECT id,name,unified_address,transparent_address,transparent_zatoshi,orchard_zatoshi FROM accounts ORDER BY id")?;
+            query
+                .query_map([], row_account)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let seed = hex::decode(self.seed()?).context("invalid wallet seed")?;
+        let network = local_network();
+        for account in &mut accounts {
+            if (1..=USER_ACCOUNT_COUNT).contains(&account.id) {
+                account.unified_full_viewing_key =
+                    Some(derived_full_viewing_key(&seed, account.id)?.encode(&network));
+            }
+        }
+        Ok(accounts)
     }
 
     pub fn user_accounts(&self) -> Result<Vec<Account>> {
@@ -343,6 +356,7 @@ fn row_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         name: row.get(1)?,
         unified_address: row.get(2)?,
         transparent_address: row.get(3)?,
+        unified_full_viewing_key: None,
         transparent_zatoshi: row.get(4)?,
         orchard_zatoshi: row.get(5)?,
     })
@@ -362,14 +376,18 @@ fn row_activity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Activity> {
         created_at: row.get(10)?,
     })
 }
+fn derived_full_viewing_key(seed: &[u8], id: u8) -> Result<UnifiedFullViewingKey> {
+    let index = id.checked_sub(1).context("invalid account id")?;
+    let account = zip32::AccountId::try_from(u32::from(index))
+        .map_err(|_| anyhow::anyhow!("invalid ZIP-32 account {id}"))?;
+    let usk = UnifiedSpendingKey::from_seed(&local_network(), seed, account)
+        .map_err(|error| anyhow::anyhow!("deriving account {id}: {error:?}"))?;
+    Ok(usk.to_unified_full_viewing_key())
+}
+
 fn derived_addresses(seed: &[u8], id: u8) -> Result<(String, String)> {
     let network = local_network();
-    let account = zip32::AccountId::try_from(u32::from(id - 1))
-        .map_err(|_| anyhow::anyhow!("invalid ZIP-32 account {id}"))?;
-    let usk = UnifiedSpendingKey::from_seed(&network, seed, account)
-        .map_err(|error| anyhow::anyhow!("deriving account {id}: {error:?}"))?;
-    let (ua, _) = usk
-        .to_unified_full_viewing_key()
+    let (ua, _) = derived_full_viewing_key(seed, id)?
         .default_address(UnifiedAddressRequest::AllAvailableKeys)
         .map_err(|error| anyhow::anyhow!("deriving account {id} address: {error:?}"))?;
     let transparent = ua
@@ -440,6 +458,124 @@ mod tests {
         store.initialize().unwrap();
         assert_eq!(store.accounts().unwrap().len(), 6);
         assert_eq!(store.user_accounts().unwrap().len(), 5);
+    }
+    #[test]
+    fn existing_store_exports_user_viewing_keys_without_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let seed = [7u8; 32];
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE accounts (
+                     id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                     unified_address TEXT NOT NULL, transparent_address TEXT NOT NULL,
+                     transparent_zatoshi INTEGER NOT NULL DEFAULT 0,
+                     orchard_zatoshi INTEGER NOT NULL DEFAULT 0
+                 );",
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO metadata(key,value) VALUES('seed',?1)",
+                [hex::encode(seed)],
+            )
+            .unwrap();
+            for id in 1..=TREASURY_ACCOUNT_ID {
+                let (ua, taddr) = derived_addresses(&seed, id).unwrap();
+                db.execute(
+                    "INSERT INTO accounts
+                     (id,name,unified_address,transparent_address,transparent_zatoshi,orchard_zatoshi)
+                     VALUES(?1,?2,?3,?4,123,456)",
+                    params![id, format!("Account {id}"), ua, taddr],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = Store::open(&path).unwrap();
+        let users = store.user_accounts().unwrap();
+        assert_eq!(
+            users.iter().map(|a| a.id).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+        let network = local_network();
+        let mut distinct = std::collections::HashSet::new();
+        for account in &users {
+            let json = serde_json::to_value(account).unwrap();
+            let encoded = json["unified_full_viewing_key"]
+                .as_str()
+                .expect("user projection must contain a viewing key");
+            let viewing = zcash_keys::keys::UnifiedFullViewingKey::decode(&network, encoded)
+                .unwrap_or_else(|_| panic!("user viewing key must decode for regtest"));
+            let (ua, _) = viewing
+                .default_address(UnifiedAddressRequest::AllAvailableKeys)
+                .unwrap();
+            assert!(ua.encode(&network) == account.unified_address);
+            let transparent = ua.transparent().cloned().expect("transparent receiver");
+            assert!(
+                Address::Transparent(transparent).encode(&network) == account.transparent_address
+            );
+            let index = zip32::AccountId::try_from(u32::from(account.id - 1)).unwrap();
+            let expected = UnifiedSpendingKey::from_seed(&network, &seed, index)
+                .unwrap()
+                .to_unified_full_viewing_key()
+                .encode(&network);
+            assert!(encoded == expected);
+            assert!(distinct.insert(encoded.to_owned()));
+            assert_eq!(account.transparent_zatoshi, 123);
+            assert_eq!(account.orchard_zatoshi, 456);
+        }
+
+        let all = store.accounts().unwrap();
+        assert_eq!(all.len(), 6);
+        let treasury = all.iter().find(|a| a.id == TREASURY_ACCOUNT_ID).unwrap();
+        assert!(
+            serde_json::to_value(treasury)
+                .unwrap()
+                .get("unified_full_viewing_key")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(store.account(TREASURY_ACCOUNT_ID).unwrap())
+                .unwrap()
+                .get("unified_full_viewing_key")
+                .is_none()
+        );
+        store.initialize().unwrap();
+        assert!(users == store.user_accounts().unwrap());
+        {
+            let db = store.0.lock().unwrap();
+            let columns = db
+                .prepare("PRAGMA table_info(accounts)")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                columns,
+                [
+                    "id",
+                    "name",
+                    "unified_address",
+                    "transparent_address",
+                    "transparent_zatoshi",
+                    "orchard_zatoshi",
+                ]
+            );
+            let metadata_keys = db
+                .prepare("SELECT key FROM metadata ORDER BY key")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(metadata_keys, ["seed"]);
+        }
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert!(users == reopened.user_accounts().unwrap());
     }
     #[test]
     fn records_real_transfer_without_mutating_balances() {
