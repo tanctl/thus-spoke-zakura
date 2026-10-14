@@ -111,7 +111,11 @@ pub(crate) async fn status(
         height: chain.blocks,
         hash: chain.bestblockhash.clone(),
     });
-    let settlement = settlement_status(node_tip.as_ref(), lightwalletd.as_ref(), &wallet_sync);
+    let mut settlement = settlement_status(node_tip.as_ref(), lightwalletd.as_ref(), &wallet_sync);
+    if settlement.settled && state.0.mining.chain_operations.try_read().is_err() {
+        settlement.settled = false;
+        settlement.settlement_blocker = Some("chain_operation");
+    }
     Ok(Json(Status {
         instance: state.0.instance.clone(),
         node,

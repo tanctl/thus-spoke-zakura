@@ -384,6 +384,8 @@ Running `ths` with no command starts the default environment.
 | `ths run -- npm test` | Run a command in a fresh, settled environment and delete it afterward |
 | `ths --name protocol wait` | Wait for an existing environment to settle |
 | `ths mine 10` | Mine blocks on the running environment and synchronize its wallet |
+| `ths reorg --depth N [--keep-txs]` | Replace recent Regtest blocks, optionally attempting transaction reinclusion |
+| `ths rollback --depth N` | Remove recent Regtest blocks without replacements |
 | `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address; repeat the same command to check a pending payment |
 | `ths faucet <ADDRESS> --amount 2.5` | Send a custom amount of up to 5 disposable ZEC |
 | `ths wallet balances` | Print each development account's balances and addresses |
@@ -495,6 +497,7 @@ cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery
 # The preceding command runs helper tests; the live test remains ignored.
 docker pull zakuracore/zakura:1.6.0
 docker build -f docker/lightwalletd.Dockerfile -t ths-recovery-lightwalletd:local .
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact reorg_and_rollback_preserve_canonical_wallet_and_payment_state
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact startup_funding_retry_after_auto_mine_failure_has_one_payout
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
