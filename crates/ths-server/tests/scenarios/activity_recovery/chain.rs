@@ -1,51 +1,4 @@
 use super::*;
-use zcash_client_backend::data_api::{Account as _, WalletRead, wallet::ConfirmationsPolicy};
-
-fn assert_wallet_balances(fixture: &RegtestStack, accounts: &[serde_json::Value]) -> Result<()> {
-    let one = Some(BlockHeight::from_u32(1));
-    let network = LocalNetwork {
-        overwinter: one,
-        sapling: one,
-        blossom: one,
-        heartwood: one,
-        canopy: one,
-        nu5: one,
-        nu6: one,
-        nu6_1: one,
-        nu6_2: one,
-        nu6_3: one,
-        nu7: None,
-    };
-    let wallet = zcash_client_sqlite::WalletDb::for_path(
-        fixture.data_dir().join("wallet.db"),
-        network,
-        zcash_client_sqlite::util::SystemClock,
-        rand10::rand_core::UnwrapErr(rand10::rngs::SysRng),
-    )?;
-    let summary = wallet
-        .get_wallet_summary(ConfirmationsPolicy::MIN)?
-        .context("wallet summary missing after reconciliation")?;
-    for id in wallet.get_account_ids()? {
-        let account = wallet.get_account(id)?.context("wallet account missing")?;
-        if account.name() == Some("Account 6") {
-            continue;
-        }
-        let public = accounts
-            .iter()
-            .find(|public| public["name"].as_str() == account.name())
-            .context("public wallet account missing")?;
-        let balance = summary
-            .account_balances()
-            .get(&id)
-            .context("wallet balance missing")?;
-        anyhow::ensure!(
-            public["ironwood_zatoshi"] == u64::from(balance.ironwood_balance().total())
-                && public["transparent_zatoshi"] == u64::from(balance.unshielded_balance().total()),
-            "published balances differ from the reconciled wallet"
-        );
-    }
-    Ok(())
-}
 
 pub(super) async fn reorg_and_rollback_preserve_canonical_wallet_and_payment_state() -> Result<()> {
     for keep_txs in [false, true] {
@@ -53,6 +6,22 @@ pub(super) async fn reorg_and_rollback_preserve_canonical_wallet_and_payment_sta
         let scenario = async {
             fixture.start().await?;
             let client = Client::new();
+            let ancestor_accounts: Vec<serde_json::Value> = request_json(
+                &client,
+                fixture.api_url(),
+                "/api/v1/accounts",
+                None,
+                API_READ_TIMEOUT,
+            )
+            .await?;
+            for account in &ancestor_accounts {
+                anyhow::ensure!(
+                    account["transparent_zatoshi"] == 0
+                        && account["ironwood_zatoshi"]
+                            == if account["id"] == 1 { 500_000_000 } else { 0 },
+                    "unexpected retained-ancestor balances: {ancestor_accounts:?}"
+                );
+            }
             let body = json!({"from_account":1,"to_account":2,"source_pool":"ironwood",
                 "destination_pool":"ironwood","amount_zatoshi":1_000_000,
                 "idempotency_key":"reorg-original-payment"});
@@ -64,6 +33,8 @@ pub(super) async fn reorg_and_rollback_preserve_canonical_wallet_and_payment_sta
                 SEND_TIMEOUT,
             )
             .await?;
+            let original_transactions = constructed_transactions(fixture.data_dir())?;
+            let original_journal = prepared_payment_journal(fixture.data_dir())?;
             let _: serde_json::Value = request_json(
                 &client,
                 fixture.api_url(),
@@ -195,6 +166,18 @@ pub(super) async fn reorg_and_rollback_preserve_canonical_wallet_and_payment_sta
                     current[0].status == "unconfirmed" && current[0].block_hash.is_none(),
                     "dropped payment still reported confirmation"
                 );
+                let after: Vec<serde_json::Value> = request_json(
+                    &client,
+                    fixture.api_url(),
+                    "/api/v1/accounts",
+                    None,
+                    API_READ_TIMEOUT,
+                )
+                .await?;
+                anyhow::ensure!(
+                    after == ancestor_accounts,
+                    "reorg retained orphaned payment balance effects: {after:?}"
+                );
             }
 
             let rollback: serde_json::Value = request_json(
@@ -212,6 +195,18 @@ pub(super) async fn reorg_and_rollback_preserve_canonical_wallet_and_payment_sta
                         .as_array()
                         .is_some_and(Vec::is_empty),
                 "rollback mined replacements"
+            );
+            let accounts: Vec<serde_json::Value> = request_json(
+                &client,
+                fixture.api_url(),
+                "/api/v1/accounts",
+                None,
+                API_READ_TIMEOUT,
+            )
+            .await?;
+            anyhow::ensure!(
+                accounts == ancestor_accounts,
+                "rollback did not restore retained-ancestor balances: {accounts:?}"
             );
             let replay: Activity = request_json(
                 &client,
@@ -253,7 +248,34 @@ pub(super) async fn reorg_and_rollback_preserve_canonical_wallet_and_payment_sta
                 API_READ_TIMEOUT,
             )
             .await?;
-            assert_wallet_balances(&fixture, &accounts)?;
+            anyhow::ensure!(
+                accounts == ancestor_accounts,
+                "restart did not preserve retained-ancestor balances: {accounts:?}"
+            );
+            let saved: Vec<Activity> = request_json(
+                &client,
+                fixture.api_url(),
+                "/api/v1/activity?idempotency_key=reorg-original-payment",
+                None,
+                API_READ_TIMEOUT,
+            )
+            .await?;
+            anyhow::ensure!(
+                saved.len() == 1
+                    && saved[0].id == original.id
+                    && saved[0].txid == original.txid
+                    && saved[0].status == "unconfirmed"
+                    && saved[0].block_hash.is_none()
+                    && constructed_transactions(fixture.data_dir())? == original_transactions
+                    && prepared_payment_journal(fixture.data_dir())? == original_journal,
+                "rollback/restart changed the saved payment or signed transactions"
+            );
+            let mempool: Vec<String> =
+                rpc(&client, fixture.node_url(), "getrawmempool", json!([])).await?;
+            anyhow::ensure!(
+                !mempool.contains(&original.txid),
+                "orphaned payment was rebroadcast after rollback/restart"
+            );
             let wallet = Connection::open_with_flags(
                 fixture.data_dir().join("wallet.db"),
                 OpenFlags::SQLITE_OPEN_READ_ONLY,
