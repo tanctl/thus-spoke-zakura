@@ -24,6 +24,9 @@ pub struct MiningJob {
     pub state: MiningState,
     pub error: Option<String>,
     pub progress_uncertain: bool,
+    /// Only set once the job reaches `Completed`: both mining and wallet
+    /// synchronization succeeded, so the mined hashes are final.
+    pub hashes: Option<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -164,6 +167,7 @@ impl MiningCoordinator {
             state: MiningState::Mining,
             error: None,
             progress_uncertain: false,
+            hashes: None,
         };
         let (sender, updates) = watch::channel(MiningUpdate {
             job: job.clone(),
@@ -284,6 +288,7 @@ impl MiningCoordinator {
         let hashes = match synchronization {
             Ok(()) => {
                 job.state = MiningState::Completed;
+                job.hashes = Some(hashes.clone());
                 Some(Arc::new(hashes))
             }
             Err(error) => {

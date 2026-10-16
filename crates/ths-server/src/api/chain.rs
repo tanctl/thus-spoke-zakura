@@ -1,4 +1,4 @@
-use super::error::{ApiResult, require_started};
+use super::error::{ApiJson, ApiResult, require_started};
 use crate::{
     chain::{ChainChangeError, ChainChangeResult, MAX_REORG_DEPTH},
     state::AppState,
@@ -21,14 +21,14 @@ pub(crate) struct RollbackRequest {
 
 pub(crate) async fn reorg(
     State(state): State<AppState>,
-    Json(req): Json<ReorgRequest>,
+    ApiJson(req): ApiJson<ReorgRequest>,
 ) -> ApiResult<Json<ChainChangeResult>> {
     change_chain(state, req.depth, true, req.keep_txs).await
 }
 
 pub(crate) async fn rollback(
     State(state): State<AppState>,
-    Json(req): Json<RollbackRequest>,
+    ApiJson(req): ApiJson<RollbackRequest>,
 ) -> ApiResult<Json<ChainChangeResult>> {
     change_chain(state, req.depth, false, false).await
 }
